@@ -108,45 +108,13 @@ void draw_border_vertical(TERM_WINDOW *tw, int width, int height, int right_bord
     }
 }
 
-typedef enum {
-    NICK_PRIORITY_OP = 0,
-    NICK_PRIORITY_VOICE = 1,
-    NICK_PRIORITY_NORMAL = 2
-} NickDisplayPriority;
-
-typedef struct {
-    NICK_REC *nick;
-    guint8 priority;
-} NickDisplayEntry;
-
-static inline guint8 nick_display_priority_for(const NICK_REC *nick)
+static gint nick_display_compare_with_server(gconstpointer a, gconstpointer b, gpointer user_data)
 {
-    if (!nick)
-        return NICK_PRIORITY_NORMAL;
-    if (nick->op)
-        return NICK_PRIORITY_OP;
-    if (nick->voice)
-        return NICK_PRIORITY_VOICE;
-    return NICK_PRIORITY_NORMAL;
-}
+    const NICK_REC *nick_a = a;
+    const NICK_REC *nick_b = b;
+    const char *nick_prefix = user_data;
 
-static gint nick_display_compare(gconstpointer a, gconstpointer b)
-{
-    const NickDisplayEntry *entry_a = a;
-    const NickDisplayEntry *entry_b = b;
-    const char *nick_a;
-    const char *nick_b;
-
-    if (!entry_a || !entry_b)
-        return 0;
-
-    if (entry_a->priority != entry_b->priority)
-        return (int) entry_a->priority - (int) entry_b->priority;
-
-    nick_a = entry_a->nick && entry_a->nick->nick ? entry_a->nick->nick : "";
-    nick_b = entry_b->nick && entry_b->nick->nick ? entry_b->nick->nick : "";
-
-    return g_ascii_strcasecmp(nick_a, nick_b);
+    return nicklist_compare((NICK_REC *) nick_a, (NICK_REC *) nick_b, nick_prefix);
 }
 
 /* 24-bit color handling function from textbuffer-view.c */
@@ -606,113 +574,109 @@ void draw_left_contents(MAIN_WINDOW_REC *mw, SP_MAINWIN_CTX *ctx)
 
 void draw_right_contents(MAIN_WINDOW_REC *mw, SP_MAINWIN_CTX *ctx)
 {
-    TERM_WINDOW *tw;
-    WINDOW_REC *aw;
-    int height;
-    int skip;
-    int index;
-    int row;
-    GSList *nt;
-    if (!ctx)
-        return;
-    tw = ctx->right_tw;
-    if (!tw)
-        return;
-    clear_window_full(tw, ctx->right_w, ctx->right_h);
-    aw = mw->active;
-    height = ctx->right_h;
-    skip = ctx->right_scroll_offset;
-    index = 0;
-    row = 0;
-    if (ctx->right_order) {
-        g_slist_free(ctx->right_order);
-        ctx->right_order = NULL;
-    }
+	TERM_WINDOW *tw;
+	WINDOW_REC *aw;
+	int height;
+	int skip;
+	int index;
+	int row;
 
-    /* If no channel active, just draw border and return */
-    if (!aw || !aw->active || !aw->active->visible_name ||
-        !IS_CHANNEL(aw->active)) {
-        draw_border_vertical(tw, ctx->right_w, ctx->right_h, 0);
-        irssi_set_dirty();
-        return;
-    }
+	if (!ctx)
+		return;
+	tw = ctx->right_tw;
+	if (!tw)
+		return;
+	clear_window_full(tw, ctx->right_w, ctx->right_h);
+	aw = mw->active;
+	height = ctx->right_h;
+	skip = ctx->right_scroll_offset;
+	index = 0;
+	row = 0;
+	if (ctx->right_order) {
+		g_slist_free(ctx->right_order);
+		ctx->right_order = NULL;
+	}
 
-    if (IS_CHANNEL(aw->active)) {
-        CHANNEL_REC *ch = CHANNEL(aw->active);
-        GSList *nicks = nicklist_getnicks(ch);
-        GPtrArray *entries = g_ptr_array_new_with_free_func(g_free);
-        GSList *order_reversed = NULL;
-        NickDisplayEntry *entry;
-        char *truncated_nick;
-        const char *status_symbol;
-        int format;
-        guint i;
-        int nick_max_width = MAX(1, ctx->right_w - 3);
+	/* If no channel active, just draw border and return */
+	if (!aw || !aw->active || !aw->active->visible_name ||
+	    !IS_CHANNEL(aw->active)) {
+		draw_border_vertical(tw, ctx->right_w, ctx->right_h, 0);
+		irssi_set_dirty();
+		return;
+	}
 
-        for (nt = nicks; nt; nt = nt->next) {
-            NICK_REC *nick = nt->data;
-            if (!nick || !nick->nick)
-                continue;
+	if (IS_CHANNEL(aw->active)) {
+		CHANNEL_REC *ch = CHANNEL(aw->active);
+		SERVER_REC *server = ch->server;
+		GSList *nicks = nicklist_getnicks(ch);
+		GSList *sorted_nicks;
+		GSList *cur;
+		const char *nick_prefix;
+		char *truncated_nick;
+		char status_str[2];
+		int format;
+		int nick_max_width = MAX(1, ctx->right_w - 3);
 
-            entry = g_new0(NickDisplayEntry, 1);
-            entry->nick = nick;
-            entry->priority = nick_display_priority_for(nick);
-            g_ptr_array_add(entries, entry);
-        }
+		if (!server) {
+			g_slist_free(nicks);
+			draw_border_vertical(tw, ctx->right_w, ctx->right_h, 0);
+			irssi_set_dirty();
+			return;
+		}
 
-        g_slist_free(nicks);
+		nick_prefix = server->get_nick_flags ? server->get_nick_flags(server) : NULL;
+		if (!nick_prefix || *nick_prefix == '\0')
+			nick_prefix = "~&@%+";
 
-        if (entries->len == 0) {
-            ctx->right_order = NULL;
-            g_ptr_array_free(entries, TRUE);
-            draw_border_vertical(tw, ctx->right_w, ctx->right_h, 0);
-            irssi_set_dirty();
-            return;
-        }
+		sorted_nicks = g_slist_copy(nicks);
+		sorted_nicks =
+			g_slist_sort_with_data(sorted_nicks,
+			                      (GCompareDataFunc) nick_display_compare_with_server,
+			                      (gpointer) nick_prefix);
+		g_slist_free(nicks);
 
-        g_ptr_array_sort(entries, (GCompareFunc) nick_display_compare);
+		status_str[1] = '\0';
 
-        for (i = 0; i < entries->len; i++) {
-            entry = g_ptr_array_index(entries, i);
-            order_reversed = g_slist_prepend(order_reversed, entry->nick);
+		for (cur = sorted_nicks; cur; cur = cur->next) {
+			NICK_REC *nick = cur->data;
 
-            if (index++ < skip)
-                continue;
+			if (!nick || !nick->nick)
+				continue;
 
-            if (row >= height)
-                continue;
+			ctx->right_order = g_slist_prepend(ctx->right_order, nick);
 
-            term_move(tw, 1, row);
+			if (index++ < skip)
+				continue;
+			if (row >= height)
+				continue;
 
-            switch (entry->priority) {
-            case NICK_PRIORITY_OP:
-                status_symbol = "@";
-                format = TXT_SIDEPANEL_NICK_OP_STATUS;
-                break;
-            case NICK_PRIORITY_VOICE:
-                status_symbol = "+";
-                format = TXT_SIDEPANEL_NICK_VOICE_STATUS;
-                break;
-            default:
-                status_symbol = "";
-                format = TXT_SIDEPANEL_NICK_NORMAL_STATUS;
-                break;
-            }
+			term_move(tw, 1, row);
 
-            truncated_nick = truncate_nick_for_sidepanel(entry->nick->nick, nick_max_width);
-            draw_str_themed_2params(tw, 1, row, mw->active, format, status_symbol, truncated_nick);
-            g_free(truncated_nick);
-            row++;
-        }
+			if (nick->prefixes[0] != '\0') {
+				status_str[0] = nick->prefixes[0];
 
-        ctx->right_order = g_slist_reverse(order_reversed);
-        g_ptr_array_free(entries, TRUE);
-    }
+				if (nick->voice && nick->prefixes[0] == '+')
+					format = TXT_SIDEPANEL_NICK_VOICE_STATUS;
+				else
+					format = TXT_SIDEPANEL_NICK_OP_STATUS;
+			} else {
+				status_str[0] = '\0';
+				format = TXT_SIDEPANEL_NICK_NORMAL_STATUS;
+			}
 
-    draw_border_vertical(tw, ctx->right_w, ctx->right_h, 0);
-    irssi_set_dirty();
+			truncated_nick = truncate_nick_for_sidepanel(nick->nick, nick_max_width);
+			draw_str_themed_2params(tw, 1, row, mw->active, format, status_str, truncated_nick);
+			g_free(truncated_nick);
+			row++;
+		}
+
+		ctx->right_order = g_slist_reverse(ctx->right_order);
+		g_slist_free(sorted_nicks);
+	}
+
+	draw_border_vertical(tw, ctx->right_w, ctx->right_h, 0);
+	irssi_set_dirty();
 }
-
 void redraw_one(MAIN_WINDOW_REC *mw)
 {
     SP_MAINWIN_CTX *ctx = get_ctx(mw, FALSE);
